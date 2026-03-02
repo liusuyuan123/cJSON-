@@ -86,15 +86,16 @@ then using the CJSON_API_VISIBILITY flag to "export" the same symbols the way CJ
 #include <stddef.h>
 
 /* cJSON Types: */
-#define cJSON_Invalid (0)
-#define cJSON_False  (1 << 0)
-#define cJSON_True   (1 << 1)
-#define cJSON_NULL   (1 << 2)
-#define cJSON_Number (1 << 3)
-#define cJSON_String (1 << 4)
-#define cJSON_Array  (1 << 5)
-#define cJSON_Object (1 << 6)
-#define cJSON_Raw    (1 << 7) /* raw json */
+/*节点类型位宏：用1<<n的位运算方式定义，优势是可组合判断（如type & (cJSON_Array|cJSON_Object),相比枚举（enum），位宏更节省内存（仅占1个int），且支持多类型判断*/
+#define cJSON_Invalid (0)//无效类型：解析失败时的默认值，用于错误处理
+#define cJSON_False  (1 << 0)//布尔false：单独标识，避免与数字/字符串混淆
+#define cJSON_True   (1 << 1)//布尔true：与false分离，符合JSON语法规范
+#define cJSON_NULL   (1 << 2)//JSON的null值：区别于空字符串/0，单独标识
+#define cJSON_Number (1 << 3)//数字类型：兼容整数和浮点数，valueint存整数，valuedouble存浮点，简化设计
+#define cJSON_String (1 << 4)//字符串类型：valuestring存储字符串值，string存储键名（仅对象子项），实现键值对分离设计
+#define cJSON_Array  (1 << 5)//数组类型：child指针指向第一个元素，元素通过next/prev链表连接，支持任意类型的元素，实现JSON数组结构
+#define cJSON_Object (1 << 6)//对象类型：child指针指向第一个键值对,需通过string字段匹配键名键值对,通过next/prev链表连接，支持任意类型的值，实现JSON对象结构
+#define cJSON_Raw    (1 << 7)//原始JSON：valuestring存储原始JSON字符串，解析时不处理转义字符，适用于嵌套JSON或需要保留格式的场景
 
 #define cJSON_IsReference 256
 #define cJSON_StringIsConst 512
@@ -103,23 +104,26 @@ then using the CJSON_API_VISIBILITY flag to "export" the same symbols the way CJ
 typedef struct cJSON
 {
     /* next/prev allow you to walk array/object chains. Alternatively, use GetArraySize/GetArrayItem/GetObjectItem */
-    struct cJSON *next;
-    struct cJSON *prev;
+    struct cJSON *next;//指向链表中的下一个元素
+    struct cJSON *prev;//指向链表中的上一个元素，使用双向链表指针管理同层级节点（数组元素 / 对象键值对）0(1) 插入/删除，遍历可前可后，仅增加2个指针开销
     /* An array or object item will have a child pointer pointing to a chain of the items in the array/object. */
     struct cJSON *child;
-
+    /*树状结构：实现 JSON 嵌套（对象 / 数组里套对象）
+    子节点指针：构建 JSON 树状嵌套结构，是解析{ "a": [1,2] }这类嵌套 JSON 的核心*/
     /* The type of the item, as above. */
-    int type;
-
+    int type;//位运算标识，节省内存，支持组合判断
+    /*节点类型位标识：用位运算（1<<n）区分类型，可通过type & cJSON_Array判断是否为数组，节省内存*/
     /* The item's string, if type==cJSON_String  and type == cJSON_Raw */
-    char *valuestring;
+    char *valuestring;//动态内存，解析时malloc分配，使用完需要free
+    /*字符串值存储：仅 type=cJSON_String 时有效，动态分配内存（parse 时 malloc），必须用 cJSON_Delete 释放*/
     /* writing to valueint is DEPRECATED, use cJSON_SetNumberValue instead */
-    int valueint;
+    int valueint;//一个结构体兼容所有数字类型
     /* The item's number, if type==cJSON_Number */
     double valuedouble;
-
+    /*数字值复用存储：整型存 valueint，浮点存 valuedouble，避免为数字单独定义多个结构体，简化设计*/
     /* The item's name string, if this item is the child of, or is in the list of subitems of an object. */
-    char *string;
+    char *string;//键名分离：实现 JSON 键值对，与值解耦
+    /*节点键名：如{"name":"cJSON"}中的 "name"，与值（valuestring）分离，实现通用键值对结构*/
 } cJSON;
 
 typedef struct cJSON_Hooks
@@ -151,6 +155,11 @@ CJSON_PUBLIC(void) cJSON_InitHooks(cJSON_Hooks* hooks);
 
 /* Memory Management: the caller is always responsible to free the results from all variants of cJSON_Parse (with cJSON_Delete) and cJSON_Print (with stdlib free, cJSON_Hooks.free_fn, or cJSON_free as appropriate). The exception is cJSON_PrintPreallocated, where the caller has full responsibility of the buffer. */
 /* Supply a block of JSON, and this returns a cJSON object you can interrogate. */
+/*1.cJSON_Parse - JSON反序列化接口
+  功能：将JSON字符串解析为cJSON链表树，是使用cJSON的入口函数
+  入参：const char *value - 待解析的JSON字符串（const保证字符串不被修改）
+  返回值：cJSON* - 成功返回根节点指针，失败/空字符串返回NULL（需检查返回值）
+  内存规则：解析生成的节点需调用cJSON_Delete释放，否则内存泄漏*/
 CJSON_PUBLIC(cJSON *) cJSON_Parse(const char *value);
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLength(const char *value, size_t buffer_length);
 /* ParseWithOpts allows you to require (and check) that the JSON is null terminated, and to retrieve the pointer to the final byte parsed. */
@@ -159,6 +168,11 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated);
 
 /* Render a cJSON entity to text for transfer/storage. */
+/*2.cJSON_Print - JSON序列化接口
+  功能：将cJSON结构体转换为格式化的JSON字符串，供输出/存储使用
+  入参：const cJSON *item - 待序列化的cJSON节点（const保证节点不被修改）
+  返回值：char* - 成功返回动态分配的字符串，失败返回NULL（需手动free）
+  性能设计：先预计算字符串长度，再一次性malloc，避免多次realloc的性能损耗*/
 CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item);
 /* Render a cJSON entity to text for transfer/storage without any formatting. */
 CJSON_PUBLIC(char *) cJSON_PrintUnformatted(const cJSON *item);
@@ -168,8 +182,10 @@ CJSON_PUBLIC(char *) cJSON_PrintBuffered(const cJSON *item, int prebuffer, cJSON
 /* NOTE: cJSON is not always 100% accurate in estimating how much memory it will use, so to be safe allocate 5 bytes more than you actually need */
 CJSON_PUBLIC(cJSON_bool) cJSON_PrintPreallocated(cJSON *item, char *buffer, const int length, const cJSON_bool format);
 /* Delete a cJSON entity and all subentities. */
+/*3.cJSON_Delete - 内存释放接口
+  功能：递归释放cJSON节点及所有子节点的内存，是cJSON内存安全的核心
+  释放规则：先递归释放child子节点（先子后父），再释放当前节点，避免野指针*/
 CJSON_PUBLIC(void) cJSON_Delete(cJSON *item);
-
 /* Returns the number of items in an array (or object). */
 CJSON_PUBLIC(int) cJSON_GetArraySize(const cJSON *array);
 /* Retrieve item number "index" from array "array". Returns NULL if unsuccessful. */
@@ -298,7 +314,6 @@ CJSON_PUBLIC(char*) cJSON_SetValuestring(cJSON *object, const char *valuestring)
 /* malloc/free objects using the malloc/free functions that have been set with cJSON_InitHooks */
 CJSON_PUBLIC(void *) cJSON_malloc(size_t size);
 CJSON_PUBLIC(void) cJSON_free(void *object);
-
 #ifdef __cplusplus
 }
 #endif
