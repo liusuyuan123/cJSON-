@@ -167,8 +167,7 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLength(const char *value, size_t buffer_len
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return_parse_end, cJSON_bool require_null_terminated);
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated);
 
-/* Render a cJSON entity to text for transfer/storage. */
-/*2.cJSON_Print - JSON序列化接口
+/* Render a cJSON entity to text for transfer/storage. *//*2.cJSON_Print - JSON序列化接口
   功能：将cJSON结构体转换为格式化的JSON字符串，供输出/存储使用
   入参：const cJSON *item - 待序列化的cJSON节点（const保证节点不被修改）
   返回值：char* - 成功返回动态分配的字符串，失败返回NULL（需手动free）
