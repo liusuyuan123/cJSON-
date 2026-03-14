@@ -142,15 +142,15 @@ static int case_insensitive_strcmp(const unsigned char *string1, const unsigned 
         return 0;
     }
 
-    for(; tolower(*string1) == tolower(*string2); (void)string1++, string2++)
+    for(; tolower((int)*string1) == tolower((int)*string2); (void)string1++, string2++)
     {
         if (*string1 == '\0')
         {
             return 0;
         }
     }
-
-    return tolower(*string1) - tolower(*string2);
+    return tolower((int)*string1) - tolower((int)*string2);
+    
 }
 
 typedef struct internal_hooks
@@ -195,7 +195,7 @@ static unsigned char* cJSON_strdup(const unsigned char* string, const internal_h
         return NULL;
     }
 
-    length = strlen((const char*)string) + sizeof("");
+    length = strlen((const char*)string) + 1;
     copy = (unsigned char*)hooks->allocate(length);
     if (copy == NULL)
     {
@@ -246,9 +246,9 @@ CJSON_PUBLIC(void) cJSON_InitHooks(cJSON_Hooks* hooks)
      */
     if (hooks == NULL)
     {
-        global_hooks.allocate = malloc;    // 恢复分配函数为系统malloc
-        global_hooks.deallocate = free;    // 恢复释放函数为系统free
-        global_hooks.reallocate = realloc; // 恢复重分配函数为系统realloc
+        global_hooks.allocate = internal_malloc;    // 恢复分配函数为系统malloc
+        global_hooks.deallocate = internal_free;    // 恢复释放函数为系统free
+        global_hooks.reallocate = internal_realloc; // 恢复重分配函数为系统realloc
         return;
     }
 
@@ -366,7 +366,7 @@ static unsigned char get_decimal_point(void)
 {
 #ifdef ENABLE_LOCALES
     struct lconv *lconv = localeconv();
-    return (unsigned char) lconv->decimal_point[0];
+    return (unsigned char)(lconv ? lconv->decimal_point[0] : '.');
 #else
     return '.';
 #endif
@@ -497,52 +497,44 @@ loop_end: // 遍历终止标签（goto统一出口，避免多层break）
             }
         }
     }
-
     /* 第五步：字符串转浮点数（调用strtod）
      * strtod参数说明：
      *   - 第一个参数：待转换的字符串（本地化适配后）；
-     *   - 第二个参数：输出参数，指向转换后字符串的末尾（如"123.45e6abc"转换后，after_end指向"abc"开头）；
+     *   - 第二个参数：输出参数，指向转换后字符串末尾的指针（校验是否转换成功）
      */
     number = strtod((const char*)number_c_string, (char**)&after_end);
-    // 校验：若转换后末尾指针等于字符串开头 → 无有效数值（如空字符串/纯符号），解析失败
-    if (number_c_string == after_end)
+
+    /* 第六步：校验转换结果（避免非法数值） */
+    // 转换失败（无有效数值） 或 数值为NaN/Inf（JSON不支持），返回失败
+    if ((number_c_string == after_end) || isnan(number) || isinf(number))
     {
         input_buffer->hooks.deallocate(number_c_string); // 释放临时缓冲区
-        return false; /* parse_error - 数值解析失败 */
+        return false;
     }
 
-    /* 第六步：填充cJSON节点（兼顾浮点/整型，处理int溢出）
-     * 设计考量：
-     *   - valuedouble：存储完整浮点值（保留精度）；
-     *   - valueint：存储整型值，溢出时饱和处理（避免int溢出为负数）；
-     */
+    /* 第七步：填充cJSON节点（数值结果写入节点） */
     item->valuedouble = number; // 存储浮点数值
-
-    /* 溢出防护：saturation（饱和处理），避免int溢出
-     * 例如：数值=2147483648（超出INT_MAX=2147483647），则valueint=INT_MAX
-     */
-    if (number >= INT_MAX)
+    // 饱和处理：数值超出int范围时，设为INT_MAX/INT_MIN，避免int溢出
+    if (number > (double)INT_MAX)
     {
         item->valueint = INT_MAX;
     }
-    else if (number <= (double)INT_MIN)
+    else if (number < (double)INT_MIN)
     {
         item->valueint = INT_MIN;
     }
     else
     {
-        item->valueint = (int)number; // 数值在int范围内，直接转换
+        item->valueint = (int)number; // 数值在int范围内，直接强转
     }
-
     item->type = cJSON_Number; // 标记节点类型为数值
 
-    /* 第七步：更新缓冲区偏移（跳过已解析的数值字符）
-     * after_end - number_c_string：实际转换的数值字符长度（处理科学计数法等特殊情况）
-     */
+    /* 第八步：更新缓冲区偏移（跳过已解析的数值字符） */
     input_buffer->offset += (size_t)(after_end - number_c_string);
 
-    // 释放临时缓冲区（避免内存泄漏）
+    /* 第九步：释放临时缓冲区（内存安全） */
     input_buffer->hooks.deallocate(number_c_string);
+
     return true; // 解析成功
 }
 /* don't ask me, but the original cJSON_SetNumberValue returns an integer or double */
@@ -4068,3 +4060,195 @@ CJSON_PUBLIC(void) cJSON_free(void *object)
     //置空指针：避免后续误访问已释放的内存（仅修改函数内的形参）
     object = NULL;
 }
+/* ===================== 优化输出模块（追加到cJSON.c末尾） ===================== */
+/* 格式化打印JSON（带缩进、换行，人类可读） */
+static void print_indent(printbuffer *p, int depth)
+{
+    unsigned char *buf = ensure(p, (size_t)(depth * 4));
+    if (buf == NULL) return;
+    
+    for (int i = 0; i < depth; i++) {
+        memcpy(buf + i*4, "    ", 4);
+    }
+    p->offset += depth * 4;
+}
+
+static cJSON_bool print_value(const cJSON *item, printbuffer *p, int depth);
+
+/* 打印JSON键值对（带格式化） */
+static cJSON_bool print_pair(const cJSON *item, printbuffer *p, int depth)
+{
+    unsigned char *buf = NULL;
+    size_t len = 0;
+
+    /* 打印缩进 */
+    print_indent(p, depth);
+    if (p->buffer == NULL) return false;
+
+    /* 打印键名 */
+    len = strlen(item->string) + 2; // 包含双引号
+    buf = ensure(p, len);
+    if (buf == NULL) return false;
+    sprintf((char*)buf, "\"%s\"", item->string);
+    p->offset += len - 1; // 减去sprintf自动加的\0
+
+    /* 打印冒号+空格 */
+    buf = ensure(p, 2);
+    if (buf == NULL) return false;
+    memcpy(buf, ": ", 2);
+    p->offset += 2;
+
+    /* 打印值 */
+    return print_value(item, p, depth);
+}
+
+/* 打印JSON值（递归处理对象/数组） */
+static cJSON_bool print_value(const cJSON *item, printbuffer *p, int depth)
+{
+    if (item == NULL || p == NULL) return false;
+    unsigned char *buf = NULL;
+
+    switch (item->type & 0xFF) {
+        case cJSON_String:
+            len = strlen(item->valuestring) + 2;
+            buf = ensure(p, len);
+            if (buf == NULL) return false;
+            sprintf((char*)buf, "\"%s\"", item->valuestring);
+            p->offset += len - 1;
+            break;
+
+        case cJSON_Number:
+            return print_number(item, p);
+
+        case cJSON_Array: {
+            buf = ensure(p, 2); // [ + 换行
+            if (buf == NULL) return false;
+            memcpy(buf, "[\n", 2);
+            p->offset += 2;
+
+            cJSON *child = item->child;
+            while (child != NULL) {
+                print_pair(child, p, depth + 1);
+                if (child->next != NULL) {
+                    buf = ensure(p, 2); // , + 换行
+                    if (buf == NULL) return false;
+                    memcpy(buf, ",\n", 2);
+                    p->offset += 2;
+                }
+                child = child->next;
+            }
+
+            print_indent(p, depth);
+            buf = ensure(p, 2); // ] + 换行
+            if (buf == NULL) return false;
+            memcpy(buf, "]\n", 2);
+            p->offset += 2;
+            break;
+        }
+
+        default:
+            buf = ensure(p, 5);
+            if (buf == NULL) return false;
+            memcpy(buf, "null\n", 5);
+            p->offset += 5;
+            break;
+    }
+
+    return true;
+}
+
+/* 公共API：格式化输出JSON字符串 */
+CJSON_PUBLIC(char *) cJSON_PrintPretty(const cJSON *item)
+{
+    printbuffer p = {0};
+    p.hooks = global_hooks;
+    p.buffer = (unsigned char*)p.hooks.allocate(256); // 初始缓冲区
+    p.length = 256;
+    p.format = true;
+
+    if (print_value(item, &p, 0) == false) {
+        p.hooks.deallocate(p.buffer);
+        return NULL;
+    }
+
+    /* 截断多余空间 */
+    unsigned char *result = (unsigned char*)p.hooks.allocate(p.offset + 1);
+    memcpy(result, p.buffer, p.offset);
+    result[p.offset] = '\0';
+    p.hooks.deallocate(p.buffer);
+
+    return (char*)result;
+}
+
+/* 公共API：压缩输出JSON（无空格、换行，节省空间） */
+CJSON_PUBLIC(char *) cJSON_PrintCompress(const cJSON *item)
+{
+    printbuffer p = {0};
+    p.hooks = global_hooks;
+    p.buffer = (unsigned char*)p.hooks.allocate(256);
+    p.length = 256;
+    p.format = false;
+
+    if (print_value(item, &p, 0) == false) {
+        p.hooks.deallocate(p.buffer);
+        return NULL;
+    }
+
+    unsigned char *result = (unsigned char*)p.hooks.allocate(p.offset + 1);
+    memcpy(result, p.buffer, p.offset);
+    result[p.offset] = '\0';
+    p.hooks.deallocate(p.buffer);
+
+    return (char*)result;
+}
+
+/* 调试用：带颜色输出JSON（终端友好） */
+CJSON_PUBLIC(void) cJSON_PrintColor(const cJSON *item)
+{
+    if (item == NULL) return;
+    char *pretty = cJSON_PrintPretty(item);
+    if (pretty == NULL) return;
+
+    /* 简单颜色替换：字符串标红，数字标绿，关键字标蓝 */
+    for (char *p = pretty; *p != '\0'; p++) {
+        if (*p == '"' && *(p+1) != '\0') {
+            printf("\033[31m"); // 红色
+            putchar(*p); p++;
+            while (*p != '"' && *p != '\0') { putchar(*p); p++; }
+            putchar(*p);
+            printf("\033[0m"); // 重置
+        }
+        else if ((*p >= '0' && *p <= '9') || *p == '-' || *p == '.') {
+            printf("\033[32m"); // 绿色
+            while (((*p >= '0' && *p <= '9') || *p == '-' || *p == '.' || *p == 'e' || *p == 'E') && *p != '\0') {
+                putchar(*p); p++;
+            }
+            p--;
+            printf("\033[0m");
+        }
+        else if (strncmp(p, "null", 4) == 0 || strncmp(p, "true", 4) == 0 || strncmp(p, "false", 5) == 0) {
+            printf("\033[34m"); // 蓝色
+            if (strncmp(p, "null", 4) == 0) { printf("null"); p += 3; }
+            else if (strncmp(p, "true", 4) == 0) { printf("true"); p += 3; }
+            else if (strncmp(p, "false", 5) == 0) { printf("false"); p += 4; }
+            printf("\033[0m");
+        }
+        else {
+            putchar(*p);
+        }
+    }
+    printf("\n");
+    cJSON_free(pretty);
+}
+
+/* 简化API：直接打印JSON（自动选择格式化/压缩） */
+CJSON_PUBLIC(void) cJSON_Print(const cJSON *item, cJSON_bool pretty)
+{
+    if (item == NULL) return;
+    char *out = pretty ? cJSON_PrintPretty(item) : cJSON_PrintCompress(item);
+    if (out != NULL) {
+        printf("%s\n", out);
+        cJSON_free(out);
+    }
+}
+/* ===================== 优化输出模块 结束 ===================== */
